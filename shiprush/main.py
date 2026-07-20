@@ -71,11 +71,12 @@ def main() -> int:
     path = resource.path.format()  # substitute any store/account id as needed
 
     with ShipRushClient(
-        config.developer_token,
-        config.user_token,
-        base_url=config.base_url,
+        config.base_url,
+        developer_token=config.developer_token,
+        user_token=config.user_token,
         shipping_token=config.shipping_token,
         session_token=config.session_token,
+        api_version=config.api_version,
         timeout_seconds=config.request_timeout_seconds,
         max_retries=config.max_retries,
     ) as client:

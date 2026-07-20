@@ -4,17 +4,27 @@ Follows Source Pipeline Standards section 3: a frozen dataclass plus from_env().
 Parsing env vars (from_env) is kept separate from using them (the dataclass), so
 tests construct Config(...) directly with no real env vars set.
 
-ShipRush auth note (confirmed from ShipRush developer docs / support): the Web
-Non-Visual API uses eCommerce-style authentication -- a DeveloperToken and a
-UserToken passed as HTTP headers (with optional ShippingToken / SessionToken).
-That is why this Config carries two required secrets instead of the single
-`api_secret` in the standards skeleton. The DeveloperToken must be explicitly
-enabled by ShipRush support for these calls.
+ShipRush auth (confirmed from the ShipRush SDK, ShipRush.SDK.Transport):
+every request may carry up to four token headers, each sent only when set --
+    X-SHIPRUSH-DEVELOPER-TOKEN, X-SHIPRUSH-USER-TOKEN,
+    X-SHIPRUSH-SHIPPING-TOKEN,  X-SHIPRUSH-SESSION-TOKEN
+plus an optional X-SHIPRUSH-VERSION. The data-plane read calls this pipeline
+targets (shipments/get, shippingaccounts/get, ...) use eCommerce-style auth --
+DeveloperToken + UserToken -- and that DeveloperToken must be explicitly enabled
+by ShipRush support. We accept all four tokens (require at least one) and let the
+client send whichever are configured, mirroring the SDK exactly rather than
+hard-coding one combination.
+
+Base URLs (confirmed from the SDK's SetIsProduction):
+    production  https://api.my.shiprush.com
+    sandbox     https://sandbox.api.my.shiprush.com
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+DEFAULT_BASE_URL = "https://api.my.shiprush.com"
 
 
 def _env(name: str, default: str | None = None, *, required: bool = False) -> str | None:
@@ -36,18 +46,16 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Config:
-    # --- auth (ShipRush eCommerce-style, two tokens) ---
-    developer_token: str
-    user_token: str
+    # --- auth (all optional individually; from_env requires at least one) ---
+    developer_token: str | None = None
+    user_token: str | None = None
     shipping_token: str | None = None
     session_token: str | None = None
+    api_version: str | None = None  # X-SHIPRUSH-VERSION
 
     # --- what to pull ---
     endpoint: str = ""
-    # UNCONFIRMED default: real SOAP web-service endpoint for the Web Non-Visual
-    # API. Set SHIPRUSH_BASE_URL explicitly; do not rely on this placeholder in
-    # production. See resources.py / README open questions.
-    base_url: str = ""
+    base_url: str = DEFAULT_BASE_URL
 
     # --- destination ---
     gcs_bucket: str = ""
@@ -59,7 +67,7 @@ class Config:
 
     # --- client tuning ---
     page_size: int = 100
-    request_timeout_seconds: int = 30
+    request_timeout_seconds: int = 60  # SDK uses a 60s call timeout
     max_retries: int = 5
 
     # --- local testing ---
@@ -73,24 +81,36 @@ class Config:
         if not bucket and not local_dir:
             raise RuntimeError("Set GCS_BUCKET (production) or LOCAL_OUTPUT_DIR (local testing).")
 
+        developer_token = _env("SHIPRUSH_DEVELOPER_TOKEN") or None
+        user_token = _env("SHIPRUSH_USER_TOKEN") or None
+        shipping_token = _env("SHIPRUSH_SHIPPING_TOKEN") or None
+        session_token = _env("SHIPRUSH_SESSION_TOKEN") or None
+        if not any((developer_token, user_token, shipping_token, session_token)):
+            raise RuntimeError(
+                "Set at least one ShipRush token: SHIPRUSH_DEVELOPER_TOKEN / "
+                "SHIPRUSH_USER_TOKEN / SHIPRUSH_SHIPPING_TOKEN / SHIPRUSH_SESSION_TOKEN. "
+                "The data-read calls (shipments/get, ...) use DEVELOPER_TOKEN + USER_TOKEN."
+            )
+
         state_bucket = _env("GCP_STATE_BUCKET") or None
         last_run_file = _env("SHIPRUSH_LAST_RUN_FILE_LOCATION") or (
             f"shiprush_last_run/{endpoint}.txt" if state_bucket else None
         )
 
         return cls(
-            developer_token=_env("SHIPRUSH_DEVELOPER_TOKEN", required=True),
-            user_token=_env("SHIPRUSH_USER_TOKEN", required=True),
-            shipping_token=_env("SHIPRUSH_SHIPPING_TOKEN") or None,
-            session_token=_env("SHIPRUSH_SESSION_TOKEN") or None,
+            developer_token=developer_token,
+            user_token=user_token,
+            shipping_token=shipping_token,
+            session_token=session_token,
+            api_version=_env("SHIPRUSH_API_VERSION") or None,
             endpoint=endpoint,
-            base_url=_env("SHIPRUSH_BASE_URL", "") or "",
+            base_url=(_env("SHIPRUSH_BASE_URL", DEFAULT_BASE_URL) or DEFAULT_BASE_URL).rstrip("/"),
             gcs_bucket=bucket,
             gcs_prefix=(_env("GCS_PREFIX", "shiprush") or "shiprush").strip("/"),
             state_bucket=state_bucket,
             last_run_file=last_run_file,
             page_size=_env_int("SHIPRUSH_PAGE_SIZE", 100),
-            request_timeout_seconds=_env_int("SHIPRUSH_REQUEST_TIMEOUT", 30),
+            request_timeout_seconds=_env_int("SHIPRUSH_REQUEST_TIMEOUT", 60),
             max_retries=_env_int("SHIPRUSH_MAX_RETRIES", 5),
             local_output_dir=local_dir,
         )

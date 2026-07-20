@@ -1,27 +1,28 @@
 """Offline test suite -- no network, no GCP credentials required.
 
-Follows Source Pipeline Standards section 10. Covers the parts that are
-CONFIRMED and source-agnostic today: the raw-ingestion envelope, the flat GCS
-path convention, config parsing rules, and resource-registry validation.
+Follows Source Pipeline Standards section 10. Covers the parts that are CONFIRMED
+(from the ShipRush SDK) and source-agnostic today: the raw-ingestion envelope,
+the flat GCS path, config parsing, resource-registry validation, the confirmed
+transport (token headers, URL, XML parsing, <Error> handling, record extraction).
 
-Pagination / record-extraction / auth-header-on-the-wire tests are the ones the
-standards care most about (section 10), but they are deferred here because the
-ShipRush SOAP operation names, request XML, response wrapper element, and paging
-scheme are unconfirmed (see resources.py banner / README). They are marked xfail
-so they show up as explicit, tracked gaps rather than silently missing -- fill
-them in against the API guide or a live sample, then remove the xfail.
+The per-page request/paging assertion (section 10's key regression test) is
+deferred with xfail because the GetShipmentsRequest/Response schema is
+unconfirmed (see resources.py / README) -- fill it in from the XSD or a live
+sample, then remove the xfail.
 """
 from __future__ import annotations
 
 import json
 import os
 
+import httpx
 import pytest
 
-from client import ShipRushAPIError, ShipRushClient
+from client import ShipRushAPIError, ShipRushClient, _extract_records, _xml_to_dict
 from config import Config
-from resources import get_resource
+from resources import RESOURCES, get_resource
 from writer import LocalWriter, build_rows
+from xml.etree import ElementTree as ET
 
 
 # --------------------------------------------------------------------------- #
@@ -31,7 +32,6 @@ def test_build_rows_exact_envelope_shape():
     rows = build_rows([{"id": 1, "name": "widget"}], ingestion_time="2026-07-20T00:00:00+00:00")
     assert len(rows) == 1
     row = rows[0]
-    # Exactly the three mandated fields, nothing more, nothing flattened.
     assert set(row.keys()) == {"raw_payload", "_ingestion_time", "_payload_size_bytes"}
     assert json.loads(row["raw_payload"]) == {"id": 1, "name": "widget"}
     assert row["_ingestion_time"] == "2026-07-20T00:00:00+00:00"
@@ -40,7 +40,6 @@ def test_build_rows_exact_envelope_shape():
 
 def test_build_rows_compact_json_and_unicode():
     rows = build_rows([{"city": "Montréal"}], ingestion_time="t")
-    # Compact separators, non-ASCII preserved (ensure_ascii=False).
     assert rows[0]["raw_payload"] == '{"city":"Montréal"}'
     assert rows[0]["_payload_size_bytes"] == len('{"city":"Montréal"}'.encode("utf-8"))
 
@@ -48,10 +47,9 @@ def test_build_rows_compact_json_and_unicode():
 def test_local_writer_flat_path_convention(tmp_path):
     writer = LocalWriter(str(tmp_path), prefix="shiprush")
     rows = build_rows([{"id": 1}], ingestion_time="t")
-    dest, count = writer.write(rows, endpoint="orders", epoch=1700000000)
+    dest, count = writer.write(rows, endpoint="shipments", epoch=1700000000)
     assert count == 1
-    # {prefix}/{endpoint}_{epoch}.ndjson -- flat, not date-partitioned (section 8).
-    assert dest == os.path.join(str(tmp_path), "shiprush", "orders_1700000000.ndjson")
+    assert dest == os.path.join(str(tmp_path), "shiprush", "shipments_1700000000.ndjson")
     with open(dest, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
     assert len(lines) == 1
@@ -60,8 +58,7 @@ def test_local_writer_flat_path_convention(tmp_path):
 
 def test_local_writer_skips_empty(tmp_path):
     writer = LocalWriter(str(tmp_path), prefix="shiprush")
-    dest, count = writer.write([], endpoint="orders", epoch=1)
-    assert (dest, count) == ("", 0)
+    assert writer.write([], endpoint="shipments", epoch=1) == ("", 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -73,28 +70,26 @@ def _clear_env(monkeypatch):
             monkeypatch.delenv(var, raising=False)
 
 
-def test_from_env_requires_both_tokens(monkeypatch):
+def test_from_env_requires_at_least_one_token(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "orders")
+    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "shipments")
     monkeypatch.setenv("LOCAL_OUTPUT_DIR", "/tmp/out")
-    monkeypatch.setenv("SHIPRUSH_DEVELOPER_TOKEN", "dev")
-    # UserToken missing -> loud failure.
-    with pytest.raises(RuntimeError, match="SHIPRUSH_USER_TOKEN"):
+    with pytest.raises(RuntimeError, match="at least one ShipRush token"):
         Config.from_env()
 
 
 def test_from_env_requires_bucket_or_local(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "orders")
+    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "shipments")
     monkeypatch.setenv("SHIPRUSH_DEVELOPER_TOKEN", "dev")
     monkeypatch.setenv("SHIPRUSH_USER_TOKEN", "usr")
     with pytest.raises(RuntimeError, match="GCS_BUCKET .* LOCAL_OUTPUT_DIR"):
         Config.from_env()
 
 
-def test_from_env_happy_path_and_watermark_defaults(monkeypatch):
+def test_from_env_happy_path_defaults(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "orders")
+    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "shipments")
     monkeypatch.setenv("SHIPRUSH_DEVELOPER_TOKEN", "dev")
     monkeypatch.setenv("SHIPRUSH_USER_TOKEN", "usr")
     monkeypatch.setenv("GCS_BUCKET", "my-bucket")
@@ -102,77 +97,169 @@ def test_from_env_happy_path_and_watermark_defaults(monkeypatch):
     cfg = Config.from_env()
     assert cfg.developer_token == "dev"
     assert cfg.user_token == "usr"
-    assert cfg.gcs_bucket == "my-bucket"
+    assert cfg.base_url == "https://api.my.shiprush.com"  # confirmed production default
     assert cfg.gcs_prefix == "shiprush"
-    # last_run_file derived from endpoint when a state bucket is configured.
-    assert cfg.last_run_file == "shiprush_last_run/orders.txt"
+    assert cfg.last_run_file == "shiprush_last_run/shipments.txt"
 
 
-def test_from_env_no_state_bucket_means_no_watermark_file(monkeypatch):
+def test_from_env_base_url_override_strips_slash(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "orders")
-    monkeypatch.setenv("SHIPRUSH_DEVELOPER_TOKEN", "dev")
-    monkeypatch.setenv("SHIPRUSH_USER_TOKEN", "usr")
+    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "shipments")
+    monkeypatch.setenv("SHIPRUSH_SHIPPING_TOKEN", "ship")
     monkeypatch.setenv("LOCAL_OUTPUT_DIR", "/tmp/out")
+    monkeypatch.setenv("SHIPRUSH_BASE_URL", "https://sandbox.api.my.shiprush.com/")
     cfg = Config.from_env()
-    assert cfg.state_bucket is None
-    assert cfg.last_run_file is None
+    assert cfg.base_url == "https://sandbox.api.my.shiprush.com"
 
 
 # --------------------------------------------------------------------------- #
-# Resource registry (standards section 4)
+# Resource registry (standards section 4) -- confirmed SDK endpoints
 # --------------------------------------------------------------------------- #
-def test_unknown_endpoint_raises_with_clear_message():
+def test_unknown_endpoint_raises():
     with pytest.raises(ValueError, match="Unknown SHIPRUSH_ENDPOINT 'bogus'"):
         get_resource("bogus")
 
 
-# --------------------------------------------------------------------------- #
-# Client auth wiring (CONFIRMED: two-token headers, application/xml)
-# --------------------------------------------------------------------------- #
-def test_client_sends_both_tokens_and_xml_content_type():
-    import httpx
+def test_shipments_resource_path_matches_sdk():
+    assert get_resource("shipments").path == "shipmentservice.svc/shipments/get"
 
+
+def test_every_resource_has_a_service_and_command_path():
+    for r in RESOURCES:
+        assert r.path.endswith("/get")
+        assert ".svc/" in r.path
+
+
+# --------------------------------------------------------------------------- #
+# Client transport (CONFIRMED from the SDK)
+# --------------------------------------------------------------------------- #
+def _client(handler, **kw):
+    kw.setdefault("developer_token", "dev-tok")
+    kw.setdefault("user_token", "usr-tok")
+    return ShipRushClient("https://api.my.shiprush.com", transport=httpx.MockTransport(handler), **kw)
+
+
+def test_client_sends_configured_token_headers_and_xml():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["headers"] = request.headers
-        return httpx.Response(200, text="<ok/>")
+        captured["url"] = str(request.url)
+        return httpx.Response(200, text="<Ok/>")
 
-    with ShipRushClient(
-        "dev-tok",
-        "usr-tok",
-        base_url="https://example.test",
-        shipping_token="ship-tok",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        client._request("POST", "/whatever", content="<req/>")
+    with _client(handler, shipping_token="ship-tok", api_version="84114") as client:
+        client.call("shipmentservice.svc/shipments/get", "<GetShipmentsRequest/>")
 
     h = captured["headers"]
-    assert h["DeveloperToken"] == "dev-tok"
-    assert h["UserToken"] == "usr-tok"
-    assert h["ShippingToken"] == "ship-tok"
+    assert h["X-SHIPRUSH-DEVELOPER-TOKEN"] == "dev-tok"
+    assert h["X-SHIPRUSH-USER-TOKEN"] == "usr-tok"
+    assert h["X-SHIPRUSH-SHIPPING-TOKEN"] == "ship-tok"
+    assert h["X-SHIPRUSH-VERSION"] == "84114"
     assert h["Content-Type"] == "application/xml"
+    assert captured["url"] == "https://api.my.shiprush.com/shipmentservice.svc/shipments/get"
 
 
-def test_client_raises_on_non_retryable_status():
-    import httpx
+def test_client_omits_unset_token_headers():
+    captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, text="bad request")
+        captured["headers"] = request.headers
+        return httpx.Response(200, text="<Ok/>")
 
-    with ShipRushClient("d", "u", base_url="https://example.test", transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(ShipRushAPIError, match="400"):
-            client._request("POST", "/x", content="<req/>")
+    # Only a shipping token configured.
+    c = ShipRushClient(
+        "https://api.my.shiprush.com", shipping_token="s", transport=httpx.MockTransport(handler)
+    )
+    with c as client:
+        client.call("x", "<R/>")
+    assert "X-SHIPRUSH-DEVELOPER-TOKEN" not in captured["headers"]
+    assert "X-SHIPRUSH-USER-TOKEN" not in captured["headers"]
+
+
+def test_client_requires_a_token():
+    with pytest.raises(ValueError, match="at least one ShipRush token"):
+        ShipRushClient("https://api.my.shiprush.com")
+
+
+def test_call_raises_on_error_envelope():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<Error><Message>bad token</Message></Error>")
+
+    with _client(handler) as client:
+        with pytest.raises(ShipRushAPIError, match="bad token"):
+            client.call("x", "<R/>")
+
+
+def test_call_raises_on_is_success_false():
+    body = "<GetShipmentsResponse><Messages><ShippingMessage><Text>Address1 required</Text>" \
+           "</ShippingMessage></Messages><IsSuccess>false</IsSuccess></GetShipmentsResponse>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    with _client(handler) as client:
+        with pytest.raises(ShipRushAPIError, match="Address1 required"):
+            client.call("x", "<R/>")
+
+
+def test_client_retries_then_raises_on_500():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="boom")
+
+    with _client(handler, max_retries=2) as client:
+        with pytest.raises(ShipRushAPIError, match="500"):
+            client.call("x", "<R/>")
+    assert calls["n"] == 3  # initial + 2 retries
 
 
 # --------------------------------------------------------------------------- #
-# Deferred, tracked gaps -- unconfirmed against the ShipRush API guide.
+# XML helpers (CONFIRMED -- shape-independent of the unconfirmed schema)
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(reason="ShipRush SOAP pagination/record extraction unconfirmed -- blocked on API guide", strict=True)
-def test_pagination_against_documented_scheme():
-    # TODO(blocked-on-docs): assert the exact request the client sends per page
-    # (operation, XML body, paging param/token) matches the API guide, and that
-    # records are extracted from the confirmed response wrapper element. This is
-    # the regression test standards section 10 says would catch a wrong scheme.
+def test_xml_to_dict_nested_and_repeated():
+    xml = (
+        "<Shipment><ShipmentId>abc</ShipmentId><Package><Weight>1</Weight></Package>"
+        "<Package><Weight>2</Weight></Package><Empty/></Shipment>"
+    )
+    d = _xml_to_dict(ET.fromstring(xml))
+    assert d["ShipmentId"] == "abc"
+    assert d["Package"] == [{"Weight": "1"}, {"Weight": "2"}]
+    assert d["Empty"] == ""
+
+
+def test_extract_records_by_confirmed_key():
+    xml = (
+        "<GetShipmentsResponse><Shipments>"
+        "<Shipment><ShipmentId>a</ShipmentId></Shipment>"
+        "<Shipment><ShipmentId>b</ShipmentId></Shipment>"
+        "</Shipments></GetShipmentsResponse>"
+    )
+    root = ET.fromstring(xml)
+    records = _extract_records(root, "Shipment")
+    assert [r["ShipmentId"] for r in records] == ["a", "b"]
+
+
+def test_extract_records_missing_key_returns_empty_not_a_guess():
+    xml = "<GetShipmentsResponse><Shipments><Shipment><Id>a</Id></Shipment></Shipments></GetShipmentsResponse>"
+    root = ET.fromstring(xml)
+    # Wrong/unknown key -> zero records (standards section 5), never a silent guess.
+    assert _extract_records(root, None) == []
+    assert _extract_records(root, "Order") == []
+
+
+def test_xml_namespaces_are_stripped():
+    xml = '<Shipment xmlns="http://ns"><ShipmentId>x</ShipmentId></Shipment>'
+    assert _xml_to_dict(ET.fromstring(xml)) == {"ShipmentId": "x"}
+
+
+# --------------------------------------------------------------------------- #
+# Deferred, tracked gap -- unconfirmed request/paging schema.
+# --------------------------------------------------------------------------- #
+@pytest.mark.xfail(reason="GetShipmentsRequest/paging schema unconfirmed -- blocked on kit XSD", strict=True)
+def test_paginate_sends_documented_request_and_pages():
+    # TODO(blocked-on-xsd): assert the exact GetShipmentsRequest body and paging
+    # params the client sends, and that records are extracted from the confirmed
+    # response wrapper element. This is standards section 10's regression test.
     raise NotImplementedError

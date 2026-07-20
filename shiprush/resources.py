@@ -1,30 +1,20 @@
-"""Registry of ShipRush resources that expose a listable collection.
+"""Registry of ShipRush data-read resources.
 
 One Cloud Run Job instance pulls exactly one resource, selected via the
-SHIPRUSH_ENDPOINT env var and validated here (Source Pipeline Standards section
+SHIPRUSH_ENDPOINT env var and validated here (Source Pipeline Standards sections
 1 & 4). Adding a resource is a code change here, not a free-form env string.
 
-=============================================================================
-UNCONFIRMED -- BLOCKED ON DOCS. The ShipRush "Web Non-Visual API" is a SOAP/XML
-web service (DeveloperToken + UserToken headers, Content-Type application/xml),
-not the REST/JSON collection model the standards skeleton assumes. The exact
-list-operation names, XML request-body schema, response element names, the
-"wrapper" element that holds the record list (record_key equivalent), and the
-incremental-filter field are all defined in:
+Endpoints below are CONFIRMED from the ShipRush SDK command catalog
+(ShipRush.SDK.Transport.APICommands). Each `path` is the SDK's
+"{service}.svc/{command}" appended to Config.base_url, POSTed as XML.
 
-  - My.ShipRush.Shipping - Web Non-Visual API Guide
-    https://docs.shiprush.com/en/for-developers/shipping/my-shiprush-shipping-web-non-visual-api-guide~7395985101005094591
-
-That page returns 403 to automated fetchers and the API itself requires an
-enabled DeveloperToken, so these values could not be confirmed from a live
-sample. Per standards sections 5 & 6, they are intentionally NOT guessed here.
-RESOURCES is left empty until a live sample or the doc text pins down, per
-resource: (a) the SOAP operation name, (b) the request XML shape, (c) the
-response record wrapper element (record_key), (d) whether it supports an
-incremental "updated since" filter and under what field name.
-
-Fill in the commented example below once confirmed, then delete this banner.
-=============================================================================
+STILL UNCONFIRMED per resource (blocked on the kit's XSD / ShipRush.SDK.Proxies,
+which define the request/response schema -- not in the pasted docs): the request
+body filter fields (incl. any "updated since"/date-window filter -> drives
+`updated_since_param`), the paging scheme, and the response element that wraps
+the record list (`record_key`). Per standards sections 5 & 6 these are left as
+None (which makes extraction return zero rows -- visible, not a silent wrong
+guess) until pinned down from the XSD or one live response.
 """
 from __future__ import annotations
 
@@ -34,20 +24,27 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Resource:
     name: str
-    # For a SOAP source, `path` is the request path/operation appended to
-    # Config.base_url (or the SOAP action name). Confirm against the API guide.
+    # SDK "{service}.svc/{command}", appended to Config.base_url. Confirmed.
     path: str
-    updated_since_param: str | None = "updated_since"  # None = no incremental support
-    record_key: str | None = None  # CONFIRMED response wrapper key/element -- see banner
+    # None = no incremental filter (or not yet confirmed) -> full pull.
+    updated_since_param: str | None = None
+    # Confirmed response wrapper element (localname) -> set from XSD/live sample.
+    record_key: str | None = None
 
 
 RESOURCES: tuple[Resource, ...] = (
-    # Resource(
-    #     name="orders",                 # SHIPRUSH_ENDPOINT value
-    #     path="<confirmed operation>",  # from Web Non-Visual API Guide
-    #     updated_since_param="<confirmed field or None>",
-    #     record_key="<confirmed response wrapper element>",
-    # ),
+    # Primary target: shipment history/records.  GET_SHIPMENTS in the SDK.
+    Resource(name="shipments", path="shipmentservice.svc/shipments/get"),
+    # Configured shipping accounts.  GET_SHIPPINGACCOUNTS in the SDK.
+    Resource(name="shippingaccounts", path="accountservice.svc/shippingaccounts/get"),
+    # Product catalog.  CATALOG_GET_CATALOG in the SDK.
+    Resource(name="catalog", path="catalogservice.svc/catalog/get"),
+    # Inventory levels.  INVENTORY_GET_INVENTORY in the SDK.
+    Resource(name="inventory", path="catalogservice.svc/inventory/get"),
+    # Inventory locations.  INVENTORY_GET_INVENTORYLOCATIONS in the SDK.
+    Resource(name="inventory_locations", path="catalogservice.svc/inventory/locations/get"),
+    # TODO(blocked-on-xsd): set updated_since_param + record_key per resource
+    # from the GetShipmentsRequest/Response (and peers) schema before shipping.
 )
 
 _BY_NAME = {r.name: r for r in RESOURCES}
@@ -55,6 +52,7 @@ _BY_NAME = {r.name: r for r in RESOURCES}
 
 def get_resource(name: str) -> Resource:
     if name not in _BY_NAME:
-        known = ", ".join(_BY_NAME) or "(none registered yet -- see resources.py banner)"
-        raise ValueError(f"Unknown SHIPRUSH_ENDPOINT {name!r}. Known resources: {known}")
+        raise ValueError(
+            f"Unknown SHIPRUSH_ENDPOINT {name!r}. Known resources: {', '.join(_BY_NAME)}"
+        )
     return _BY_NAME[name]
