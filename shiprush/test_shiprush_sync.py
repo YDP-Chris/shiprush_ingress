@@ -1,14 +1,10 @@
 """Offline test suite -- no network, no GCP credentials required.
 
-Follows Source Pipeline Standards section 10. Covers the parts that are CONFIRMED
-(from the ShipRush SDK) and source-agnostic today: the raw-ingestion envelope,
-the flat GCS path, config parsing, resource-registry validation, the confirmed
-transport (token headers, URL, XML parsing, <Error> handling, record extraction).
-
-The per-page request/paging assertion (section 10's key regression test) is
-deferred with xfail because the GetShipmentsRequest/Response schema is
-unconfirmed (see resources.py / README) -- fill it in from the XSD or a live
-sample, then remove the xfail.
+Follows Source Pipeline Standards section 10. Covers the raw-ingestion envelope,
+the flat GCS path, config parsing, resource-registry validation, the transport
+(token headers, URL, XML parsing, <Error>/<IsSuccess> handling), direct-children
+record extraction, and -- section 10's key regression test -- the exact per-page
+request body and paging walk the client sends on the wire (mocked transport).
 """
 from __future__ import annotations
 
@@ -18,7 +14,13 @@ import os
 import httpx
 import pytest
 
-from client import ShipRushAPIError, ShipRushClient, _extract_records, _xml_to_dict
+from client import (
+    ShipRushAPIError,
+    ShipRushClient,
+    _extract_records,
+    _response_has_more,
+    _xml_to_dict,
+)
 from config import Config
 from resources import RESOURCES, get_resource
 from writer import LocalWriter, build_rows
@@ -229,24 +231,39 @@ def test_xml_to_dict_nested_and_repeated():
     assert d["Empty"] == ""
 
 
-def test_extract_records_by_confirmed_key():
+def test_extract_records_are_direct_children_of_container():
     xml = (
-        "<GetShipmentsResponse><Shipments>"
-        "<Shipment><ShipmentId>a</ShipmentId></Shipment>"
-        "<Shipment><ShipmentId>b</ShipmentId></Shipment>"
-        "</Shipments></GetShipmentsResponse>"
+        "<GetShipmentsResponse><ShipTransactions>"
+        "<TShipTransaction><ShipmentId>a</ShipmentId></TShipTransaction>"
+        "<TShipTransaction><ShipmentId>b</ShipmentId></TShipTransaction>"
+        "</ShipTransactions></GetShipmentsResponse>"
     )
     root = ET.fromstring(xml)
-    records = _extract_records(root, "Shipment")
+    records = _extract_records(root, "ShipTransactions")
     assert [r["ShipmentId"] for r in records] == ["a", "b"]
 
 
-def test_extract_records_missing_key_returns_empty_not_a_guess():
-    xml = "<GetShipmentsResponse><Shipments><Shipment><Id>a</Id></Shipment></Shipments></GetShipmentsResponse>"
+def test_extract_records_ignores_nested_same_named_records():
+    # TShipTransaction also appears NESTED inside a record (e.g. a return/linked
+    # shipment). Direct-children extraction must not double-count those.
+    xml = (
+        "<GetShipmentsResponse><ShipTransactions>"
+        "<TShipTransaction><ShipmentId>a</ShipmentId>"
+        "<LinkedReturn><TShipTransaction><ShipmentId>nested</ShipmentId></TShipTransaction></LinkedReturn>"
+        "</TShipTransaction>"
+        "</ShipTransactions></GetShipmentsResponse>"
+    )
     root = ET.fromstring(xml)
-    # Wrong/unknown key -> zero records (standards section 5), never a silent guess.
+    records = _extract_records(root, "ShipTransactions")
+    assert [r["ShipmentId"] for r in records] == ["a"]  # nested copy not surfaced as a record
+
+
+def test_extract_records_missing_container_returns_empty_not_a_guess():
+    xml = "<GetShipmentsResponse><ShipTransactions><TShipTransaction><Id>a</Id></TShipTransaction></ShipTransactions></GetShipmentsResponse>"
+    root = ET.fromstring(xml)
+    # Wrong/unknown container -> zero records (standards section 5), never a silent guess.
     assert _extract_records(root, None) == []
-    assert _extract_records(root, "Order") == []
+    assert _extract_records(root, "Orders") == []
 
 
 def test_xml_namespaces_are_stripped():
@@ -255,11 +272,101 @@ def test_xml_namespaces_are_stripped():
 
 
 # --------------------------------------------------------------------------- #
-# Deferred, tracked gap -- unconfirmed request/paging schema.
+# Pagination on the wire (standards section 10's key regression test)
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(reason="GetShipmentsRequest/paging schema unconfirmed -- blocked on kit XSD", strict=True)
-def test_paginate_sends_documented_request_and_pages():
-    # TODO(blocked-on-xsd): assert the exact GetShipmentsRequest body and paging
-    # params the client sends, and that records are extracted from the confirmed
-    # response wrapper element. This is standards section 10's regression test.
-    raise NotImplementedError
+def _shipments_page(ids, has_more):
+    items = "".join(
+        f"<TShipTransaction><ShipmentId>{i}</ShipmentId></TShipTransaction>" for i in ids
+    )
+    return (
+        "<GetShipmentsResponse>"
+        f"<ShipTransactions>{items}</ShipTransactions>"
+        f"<Paging><HasMoreData>{'true' if has_more else 'false'}</HasMoreData></Paging>"
+        "<IsSuccess>true</IsSuccess>"
+        "</GetShipmentsResponse>"
+    )
+
+
+def test_paginate_sends_date_window_and_walks_pages():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode("utf-8")
+        requests.append(body)
+        page = 1 if "<PageNumber>1</PageNumber>" in body else 2
+        if page == 1:
+            return httpx.Response(200, text=_shipments_page(["a", "b"], has_more=True))
+        return httpx.Response(200, text=_shipments_page(["c"], has_more=False))
+
+    resource = get_resource("shipments")
+    with _client(handler) as client:
+        records = list(
+            client.paginate(
+                resource,
+                since="2026-07-01T00:00:00",
+                until="2026-07-20T00:00:00",
+                page_size=2,
+            )
+        )
+
+    assert [r["ShipmentId"] for r in records] == ["a", "b", "c"]
+    assert len(requests) == 2  # stopped once HasMoreData was false
+    # The first request carries the confirmed filter + paging fields.
+    first = requests[0]
+    assert "<ModifiedFrom>2026-07-01T00:00:00</ModifiedFrom>" in first
+    assert "<ModifiedTo>2026-07-20T00:00:00</ModifiedTo>" in first
+    assert "<ItemsPerPage>2</ItemsPerPage>" in first
+    assert "<PageNumber>1</PageNumber>" in first
+    assert "<PageNumber>2</PageNumber>" in requests[1]
+
+
+def test_paginate_stops_on_empty_page_without_flag():
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Empty container, no <Paging> flag at all -> must not loop forever.
+        return httpx.Response(
+            200,
+            text="<GetShipmentsResponse><ShipTransactions/><IsSuccess>true</IsSuccess></GetShipmentsResponse>",
+        )
+
+    resource = get_resource("shipments")
+    with _client(handler) as client:
+        records = list(
+            client.paginate(resource, since="s", until="u", page_size=100)
+        )
+    assert records == []
+
+
+def test_paginate_non_paged_resource_makes_single_call():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        # A non-paged response that (incorrectly) still says HasMoreData=true;
+        # paged=False must win and stop after one call regardless.
+        return httpx.Response(
+            200,
+            text=(
+                "<GetShippingAccountsResponse><ShippingAccounts>"
+                "<TShippingAccount><Id>1</Id></TShippingAccount>"
+                "</ShippingAccounts><Paging><HasMoreData>true</HasMoreData></Paging>"
+                "</GetShippingAccountsResponse>"
+            ),
+        )
+
+    resource = get_resource("shippingaccounts")
+    assert resource.paged is False
+    with _client(handler) as client:
+        records = list(
+            client.paginate(resource, since="s", until="u", page_size=100)
+        )
+    assert calls["n"] == 1
+    assert [r["Id"] for r in records] == ["1"]
+
+
+def test_response_has_more_reads_flag():
+    yes = ET.fromstring("<R><Paging><HasMoreData>true</HasMoreData></Paging></R>")
+    no = ET.fromstring("<R><Paging><HasMoreData>false</HasMoreData></Paging></R>")
+    none = ET.fromstring("<R><ShipTransactions/></R>")
+    assert _response_has_more(yes) is True
+    assert _response_has_more(no) is False
+    assert _response_has_more(none) is False

@@ -5,15 +5,15 @@ NDJSON in GCS, following the team's **Source Pipeline Standards** (the living do
 that starts any pipeline work; reference implementation: `redo-sync`, companion:
 `brightpearl`).
 
-> **Status: scaffold — transport confirmed, one schema input outstanding.** The
-> source-agnostic standards layer and the full ShipRush *transport* (auth, URLs,
-> XML handling, error handling, resource registry) are implemented and tested.
-> The only piece still open is the `GetShipmentsRequest`/`Response` **schema**
-> (filter fields, paging, record-wrapper element), which lives in the SDK kit's
-> XSD / `ShipRush.SDK.Proxies` and isn't guessable — see
-> [Open questions](#open-questions-blocking-completion). Per the standards' rule
-> (never guess pagination / record-keys / endpoints), `client.paginate()` raises
-> until that schema is in hand.
+> **Status: implemented against the confirmed SDK + XSD schema.** The
+> source-agnostic standards layer, the ShipRush transport (auth, URLs, XML
+> handling, error handling), the resource registry, and end-to-end pagination
+> are all implemented and covered by an offline test suite. The request bodies,
+> paging scheme, and record-wrapper elements are taken from the SDK command
+> catalog and the API XSD — not guessed (standards §5–§6). A short list of
+> server behaviours the XSD does not pin down (PageNumber base, date-sentinel
+> semantics) is isolated in `resources.py` and flagged `TODO(verify-live)` to
+> confirm against one sandbox response before production.
 
 ## Architecture (per standards §1–§2)
 
@@ -41,7 +41,10 @@ Two things about ShipRush shaped this build:
    JSON; here every call is an XML `POST` and responses are parsed to dicts before
    landing in the standard envelope. The `_xml_to_dict` / `_extract_records`
    helpers in `client.py` do that conversion (namespaces stripped, repeated
-   elements collapsed to lists).
+   elements collapsed to lists). Records are the **direct children** of the
+   response's container element — never any-descendant, because a record type
+   like `TShipTransaction` also appears nested inside a shipment and would
+   otherwise be double-counted (the wrong-list trap, §5).
 2. **The prose "Web Non-Visual API" guide is transactional** (`rate`, `ship`,
    `void`, `tracking`, …) with **no listable history** — ShipRush states it
    retains shipping history only ~7 days and that persistence "is the job of the
@@ -94,29 +97,36 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q          # offline: no network, no GCP credentials
 ```
 
-21 tests cover the confirmed layer (envelope, flat path, config rules, registry,
+26 tests cover the full layer (envelope, flat path, config rules, registry,
 token headers + URL on the wire, `<Error>`/`IsSuccess` handling, XML→dict,
-record extraction). One `xfail` marks the per-page request/paging regression test
-as a tracked gap pending the schema.
+direct-children extraction incl. the nested-record trap, and the per-page
+request-body + paging walk over a mocked transport — §10's regression test).
 
-## Open questions (blocking completion)
+## Confirmed request/paging schema (from the SDK command catalog + API XSD)
 
-`client.paginate()` and per-resource `record_key`/`updated_since_param` need the
-`GetShipmentsRequest`/`Response` schema, which is defined in the SDK kit's **XSD**
-("XSD that describes constants and the TShipment schema") and the
-`ShipRush.SDK.Proxies` assemblies — not in the pasted API guide or SDK source.
-To finish without guessing, one of:
+Each resource's request body lives in `resources.py`; `client.paginate()` drives
+the loop generically.
 
-1. **The kit's XSD / proxy request+response classes**, or
-2. **One live `shipments/get` request + response sample**,
+| Resource | `SHIPRUSH_ENDPOINT` | Path | Container (records = direct children) | Date filter | Paged |
+|---|---|---|---|---|---|
+| Shipments | `shipments` | `shipmentservice.svc/shipments/get` | `ShipTransactions` | `ModifiedFrom`/`ModifiedTo` | ✅ |
+| Catalog | `catalog` | `catalogservice.svc/catalog/get` | `CatalogItems` | `ModifiedAtFrom`/`ModifiedAtTo` | ✅ |
+| Inventory | `inventory` | `catalogservice.svc/inventory/get` | `InventoryItems` | `InventoryItemModifiedAtFrom`/`To` | ✅ |
+| Inventory locations | `inventory_locations` | `catalogservice.svc/inventory/locations/get` | `MerchantLocations` | `ModifiedAtFrom`/`ModifiedAtTo` | ✅ |
+| Shipping accounts | `shippingaccounts` | `accountservice.svc/shippingaccounts/get` | `ShippingAccounts` | none | — |
 
-pinning down, for `shipments` (and each other resource):
-- the **request body** filter fields — especially any date-window / "updated
-  since" filter (drives watermarking, §9);
-- the **paging** scheme (page size + cursor/offset, and where the cursor is);
-- the **response wrapper element** that holds the shipment records (the
-  `record_key`).
+- **Paging** — the request carries `ItemsPerPage` + `PageNumber` (1-based); the
+  response carries `<Paging>` (DataPaging) with `<HasMoreData>`. `paginate()`
+  walks pages until `HasMoreData` is false (also stopping on an empty page).
+- **Watermarking (§9)** — for incremental resources with `GCP_STATE_BUCKET` set,
+  the pull window is `[stored watermark, run-start)`; the watermark advances to
+  the run-start time even on a zero-record run. Without a state bucket (or for
+  the non-incremental `shippingaccounts`), it's a full pull.
 
-Also needed to validate against the live API: an **enabled** DeveloperToken +
-UserToken (sandbox `https://sandbox.api.my.shiprush.com` first — production
-shipping must never run on sandbox).
+### To verify against the live API before production
+
+Isolated in `resources.py` and flagged `TODO(verify-live)`: the `PageNumber`
+base (assumed 1), whether the wide sentinel dates on unused date filters mean
+"no filter", and the max `ItemsPerPage`. Confirm these against one **sandbox**
+(`https://sandbox.api.my.shiprush.com`) response — production shipping must
+never run on sandbox — using an **enabled** DeveloperToken + UserToken.

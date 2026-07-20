@@ -10,13 +10,12 @@ Transport is CONFIRMED from the ShipRush SDK (ShipRush.SDK.Transport):
   - Errors come back as <Error><Message>...</Message></Error>; on HTTP 200 the
     business status is in-band via <IsSuccess> / <Messages>.
 
-STILL UNCONFIRMED (blocked on the kit's XSD / ShipRush.SDK.Proxies): the
-GetShipmentsRequest body (filters, paging) and the GetShipmentsResponse wrapper
-element. paginate() therefore raises until those are pinned down -- guessing the
-request/paging scheme is exactly what standards sections 5 & 6 forbid. The
-confirmed building blocks (call(), _xml_to_dict, _extract_records) are
-implemented and tested so wiring paginate() is a small, localized change once
-the schema is in hand.
+Request/paging schema is CONFIRMED from the kit's XSD: the request carries
+ItemsPerPage + PageNumber (1-based) and a Modified* date window; the response
+carries a DataPaging <HasMoreData> flag and wraps records in a container element
+whose DIRECT children are the records (see resources.py). paginate() loops pages
+until HasMoreData is false. The per-resource request bodies live in resources.py
+so the transport here stays source-agnostic.
 """
 from __future__ import annotations
 
@@ -64,22 +63,51 @@ def _xml_to_dict(element: ET.Element) -> Any:
     return result
 
 
-def _extract_records(root: ET.Element, record_key: str | None) -> list[dict[str, Any]]:
-    """Extract records by the confirmed wrapper element localname.
+def _find_container(root: ET.Element, container: str | None) -> ET.Element | None:
+    """Find the first element whose localname is `container` (anywhere in tree)."""
+    if not container:
+        return None
+    for el in root.iter():
+        if _localname(el.tag) == container:
+            return el
+    return None
 
-    Mirrors standards section 5: only pull from the explicitly-confirmed
-    record_key. A missing/wrong key yields zero records (visible in the run
-    summary) rather than a silent wrong guess.
+
+def _extract_records(root: ET.Element, container: str | None) -> list[dict[str, Any]]:
+    """Extract records as the DIRECT children of the confirmed container element.
+
+    ShipRush wraps a page of records in a container element (ShipTransactions,
+    CatalogItems, ...); each record is a direct child of that container. We take
+    only direct children -- crucially NOT any-descendant -- because a record type
+    such as TShipTransaction also appears *nested* inside a shipment, and an
+    any-descendant scan would double-count those nested copies (the wrong-list
+    trap standards section 5 warns about).
+
+    Mirrors standards section 5: a missing/wrong container yields zero records
+    (visible in the run summary) rather than a silent wrong guess.
     """
-    if not record_key:
+    parent = _find_container(root, container)
+    if parent is None:
         return []
     records = []
-    for el in root.iter():
-        if _localname(el.tag) == record_key:
-            value = _xml_to_dict(el)
-            if isinstance(value, dict):
-                records.append(value)
+    for child in list(parent):
+        value = _xml_to_dict(child)
+        if isinstance(value, dict):
+            records.append(value)
     return records
+
+
+def _response_has_more(root: ET.Element) -> bool:
+    """Read the DataPaging <HasMoreData> flag from a response.
+
+    Confirmed from the XSD: paged responses carry a <Paging> (DataPaging) block
+    with a <HasMoreData> boolean. Absence of the flag is treated as "no more"
+    so the loop terminates rather than spinning forever.
+    """
+    for el in root.iter():
+        if _localname(el.tag) == "HasMoreData":
+            return (el.text or "").strip().lower() == "true"
+    return False
 
 
 class ShipRushClient:
@@ -204,24 +232,38 @@ class ShipRushClient:
 
     def paginate(
         self,
-        path: str,
+        resource,
         *,
-        params=None,
+        since: str,
+        until: str,
         page_size: int = 100,
-        record_key: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield one dict per record across all pages of a ShipRush read call.
 
-        TODO(blocked-on-xsd): build the request XML (e.g. GetShipmentsRequest)
-        and paging from the kit's XSD / ShipRush.SDK.Proxies -- filter fields,
-        page cursor, and the response wrapper element (record_key). Then this
-        becomes: loop -> self.call(path, request_xml) -> _extract_records(root,
-        record_key) -> advance the cursor. Do NOT guess the schema (standards
-        sections 5 & 6).
+        For each page the resource builds the XML request body (carrying the
+        page number, page size and Modified* date window); we POST it, extract
+        the container's direct children, and advance to the next page while the
+        response's <HasMoreData> flag is true. Non-paged resources
+        (resource.paged is False) make a single call.
+
+        Confirmed from the XSD: request paging is ItemsPerPage + PageNumber
+        (1-based); response paging is DataPaging/<HasMoreData>. Records are the
+        direct children of resource.container.
         """
-        raise NotImplementedError(
-            "GetShipmentsRequest/Response schema (filters, paging, record wrapper) "
-            "is unconfirmed. Pin it from the kit's XSD or one live shipments/get "
-            "response, set Resource.record_key, then implement here using call() + "
-            "_extract_records. See resources.py and README open questions."
-        )
+        page = 1
+        while True:
+            request_xml = resource.build_request(
+                page=page, page_size=page_size, since=since, until=until
+            )
+            root = self.call(resource.path, request_xml)
+            records = _extract_records(root, resource.container)
+            for record in records:
+                yield record
+
+            if not resource.paged:
+                return
+            # Stop when the server says there is no more data. Also stop on an
+            # empty page as a belt-and-suspenders guard against a missing flag.
+            if not records or not _response_has_more(root):
+                return
+            page += 1
