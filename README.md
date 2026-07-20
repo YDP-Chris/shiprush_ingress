@@ -86,6 +86,7 @@ flat GCS path `{prefix}/{endpoint}_{epoch}.ndjson` (§8), GCS-state watermarking
 | `GCP_STATE_BUCKET` | no | watermark state bucket; omit for full pulls |
 | `SHIPRUSH_LAST_RUN_FILE_LOCATION` | no | watermark blob path (default `shiprush_last_run/{endpoint}.txt`) |
 | `SHIPRUSH_PAGE_SIZE` / `SHIPRUSH_REQUEST_TIMEOUT` / `SHIPRUSH_MAX_RETRIES` | no | client tuning |
+| `SHIPRUSH_MAX_PAGES` | no | safety cap (default 10000): abort if the server never stops paging |
 
 \* At least one token is required; data-read endpoints need `DEVELOPER_TOKEN` + `USER_TOKEN`.
 
@@ -117,7 +118,10 @@ the loop generically.
 
 - **Paging** — the request carries `ItemsPerPage` + `PageNumber` (1-based); the
   response carries `<Paging>` (DataPaging) with `<HasMoreData>`. `paginate()`
-  walks pages until `HasMoreData` is false (also stopping on an empty page).
+  walks pages until `HasMoreData` is false (also stopping on an empty page), and
+  aborts with an error past `SHIPRUSH_MAX_PAGES` so a server that ignores
+  `PageNumber` can't loop forever. The window timestamps carry a UTC `Z`
+  designator so the server can't read them as a naive local dateTime.
 - **Watermarking (§9)** — for incremental resources with `GCP_STATE_BUCKET` set,
   the pull window is `[stored watermark, run-start)`; the watermark advances to
   the run-start time even on a zero-record run. Without a state bucket (or for
@@ -126,7 +130,12 @@ the loop generically.
 ### To verify against the live API before production
 
 Isolated in `resources.py` and flagged `TODO(verify-live)`: the `PageNumber`
-base (assumed 1), whether the wide sentinel dates on unused date filters mean
-"no filter", and the max `ItemsPerPage`. Confirm these against one **sandbox**
-(`https://sandbox.api.my.shiprush.com`) response — production shipping must
-never run on sandbox — using an **enabled** DeveloperToken + UserToken.
+base (assumed 1 — **if it is actually 0-based, page 1 skips the first page of
+records**), whether the wide sentinel dates on unused date filters mean "no
+filter", and the max `ItemsPerPage`. Also confirm **`ModifiedFrom`/`ModifiedTo`
+inclusivity**: the watermark handoff uses a half-open `[since, until)` window
+(next run's `since` = this run's `until`), so a boundary record is dropped if
+both bounds are exclusive, or duplicated if both are inclusive. Confirm all of
+these against one **sandbox** (`https://sandbox.api.my.shiprush.com`) response —
+production shipping must never run on sandbox — using an **enabled**
+DeveloperToken + UserToken.

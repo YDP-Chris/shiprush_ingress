@@ -98,15 +98,20 @@ def _extract_records(root: ET.Element, container: str | None) -> list[dict[str, 
 
 
 def _response_has_more(root: ET.Element) -> bool:
-    """Read the DataPaging <HasMoreData> flag from a response.
+    """Read the DataPaging <HasMoreData> flag from the response's <Paging> block.
 
     Confirmed from the XSD: paged responses carry a <Paging> (DataPaging) block
-    with a <HasMoreData> boolean. Absence of the flag is treated as "no more"
-    so the loop terminates rather than spinning forever.
+    with a <HasMoreData> boolean. We read HasMoreData only from *inside* a Paging
+    element so an unrelated element of that name in a record payload can't be
+    mistaken for the paging flag. Absence of the flag is treated as "no more" so
+    the loop terminates rather than spinning forever.
     """
-    for el in root.iter():
-        if _localname(el.tag) == "HasMoreData":
-            return (el.text or "").strip().lower() == "true"
+    for paging in root.iter():
+        if _localname(paging.tag) != "Paging":
+            continue
+        for child in paging.iter():
+            if _localname(child.tag) == "HasMoreData":
+                return (child.text or "").strip().lower() == "true"
     return False
 
 
@@ -123,6 +128,7 @@ class ShipRushClient:
         user_agent: str = "shiprush-sync/0.1 (+https://github.com/ydp-chris/shiprush_ingress)",
         timeout_seconds: int = 60,
         max_retries: int = 5,
+        max_pages: int = 10_000,
         transport=None,
     ) -> None:
         if not base_url:
@@ -130,6 +136,7 @@ class ShipRushClient:
         if not any((developer_token, user_token, shipping_token, session_token)):
             raise ValueError("at least one ShipRush token is required")
         self._max_retries = max_retries
+        self._max_pages = max_pages
         # Mirror the SDK: add each token header only when it is set.
         headers = {
             "Content-Type": "application/xml",
@@ -266,4 +273,12 @@ class ShipRushClient:
             # empty page as a belt-and-suspenders guard against a missing flag.
             if not records or not _response_has_more(root):
                 return
+            # Hard safety cap: a server that ignores PageNumber and keeps
+            # returning HasMoreData=true would otherwise loop forever (re-yielding
+            # the same page until OOM). Fail loudly instead so it is investigated.
+            if page >= self._max_pages:
+                raise ShipRushAPIError(
+                    f"{resource.path}: pagination exceeded max_pages={self._max_pages} "
+                    f"(server may be ignoring PageNumber); aborting to avoid an infinite loop."
+                )
             page += 1

@@ -370,3 +370,53 @@ def test_response_has_more_reads_flag():
     assert _response_has_more(yes) is True
     assert _response_has_more(no) is False
     assert _response_has_more(none) is False
+
+
+def test_response_has_more_ignores_hasmoredata_outside_paging_block():
+    # A record payload carrying its own <HasMoreData> must NOT be read as the
+    # response paging flag (only the <Paging> block counts).
+    xml = (
+        "<R><ShipTransactions><TShipTransaction>"
+        "<HasMoreData>true</HasMoreData>"  # decoy inside a record, not paging
+        "</TShipTransaction></ShipTransactions>"
+        "<Paging><HasMoreData>false</HasMoreData></Paging></R>"
+    )
+    assert _response_has_more(ET.fromstring(xml)) is False
+
+
+def test_paginate_aborts_when_server_never_stops_paging():
+    # Server ignores PageNumber: every page is non-empty AND HasMoreData=true.
+    # The safety cap must raise instead of looping/allocating forever.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, text=_shipments_page(["x"], has_more=True))
+
+    resource = get_resource("shipments")
+    with _client(handler, max_pages=5) as client:
+        with pytest.raises(ShipRushAPIError, match="max_pages=5"):
+            list(client.paginate(resource, since="s", until="u", page_size=1))
+    assert calls["n"] == 5  # stopped exactly at the cap, not beyond
+
+
+def test_main_pull_window_timestamps_carry_utc_designator():
+    # Regression: the ModifiedFrom/To window must be an unambiguous UTC dateTime
+    # (trailing 'Z'), so the server cannot read a naive dateTime as local time.
+    from resources import _shipments_request
+
+    xml = _shipments_request(
+        page=1, page_size=100, since="2026-07-01T00:00:00Z", until="2026-07-20T12:34:56Z"
+    )
+    assert "<ModifiedFrom>2026-07-01T00:00:00Z</ModifiedFrom>" in xml
+    assert "<ModifiedTo>2026-07-20T12:34:56Z</ModifiedTo>" in xml
+
+
+def test_config_reads_max_pages(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("SHIPRUSH_ENDPOINT", "shipments")
+    monkeypatch.setenv("SHIPRUSH_DEVELOPER_TOKEN", "dev")
+    monkeypatch.setenv("SHIPRUSH_USER_TOKEN", "usr")
+    monkeypatch.setenv("LOCAL_OUTPUT_DIR", "/tmp/out")
+    monkeypatch.setenv("SHIPRUSH_MAX_PAGES", "42")
+    assert Config.from_env().max_pages == 42

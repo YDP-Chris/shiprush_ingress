@@ -35,7 +35,7 @@ def get_last_run_timestamp(config: Config) -> str:
     blob = storage.Client().bucket(config.state_bucket).blob(config.last_run_file)
     if blob.exists():
         return blob.download_as_text().strip()
-    return (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    return (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
 
 
 def set_last_run_timestamp(config: Config, timestamp: str) -> None:
@@ -63,8 +63,9 @@ def main() -> int:
     # The pull window is [since, until). `until` is this run's start time; `since`
     # is the stored watermark for incremental resources with state, else the epoch
     # start (a full pull). shippingaccounts has no date filter, so its builder
-    # ignores the window entirely.
-    until = now.strftime("%Y-%m-%dT%H:%M:%S")
+    # ignores the window entirely. Timestamps carry the UTC 'Z' designator so the
+    # server does not read the naive dateTime as its own local time.
+    until = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     watermarking_enabled = bool(config.state_bucket and resource.incremental)
     if watermarking_enabled:
         since = get_last_run_timestamp(config)
@@ -83,6 +84,7 @@ def main() -> int:
         api_version=config.api_version,
         timeout_seconds=config.request_timeout_seconds,
         max_retries=config.max_retries,
+        max_pages=config.max_pages,
     ) as client:
         records = client.paginate(
             resource, since=since, until=until, page_size=config.page_size

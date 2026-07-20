@@ -69,6 +69,7 @@ class Config:
     page_size: int = 100
     request_timeout_seconds: int = 60  # SDK uses a 60s call timeout
     max_retries: int = 5
+    max_pages: int = 10_000  # safety cap: abort if the server never stops paging
 
     # --- local testing ---
     local_output_dir: str | None = None
@@ -112,5 +113,6 @@ class Config:
             page_size=_env_int("SHIPRUSH_PAGE_SIZE", 100),
             request_timeout_seconds=_env_int("SHIPRUSH_REQUEST_TIMEOUT", 60),
             max_retries=_env_int("SHIPRUSH_MAX_RETRIES", 5),
+            max_pages=_env_int("SHIPRUSH_MAX_PAGES", 10_000),
             local_output_dir=local_dir,
         )
